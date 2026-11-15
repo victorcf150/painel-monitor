@@ -65,6 +65,7 @@ class MainActivity : Activity() {
     private lateinit var grid: GridLayout
     private val running = AtomicBoolean(false)
     private val pings = ArrayList<Double?>()
+    private var partial = ArrayList<T>()
     private var lastRx = 0L
     private var lastTx = 0L
     private var lastT = 0L
@@ -81,6 +82,7 @@ class MainActivity : Activity() {
         grid.setPadding(dp(6), dp(6), dp(6), dp(6))
         sv.addView(grid)
         setContentView(sv)
+        apply(listOf(T("init", "Painel", "iniciando…", "aguardando primeira leitura", GRAY)))
     }
 
     override fun onStart() {
@@ -88,13 +90,19 @@ class MainActivity : Activity() {
         running.set(true)
         thread {
             while (running.get()) {
-                try { sample() } catch (e: Exception) { }
+                try {
+                    sample()
+                } catch (e: Throwable) {
+                    val list = ArrayList(partial)
+                    list.add(T("err", "Erro", e.javaClass.simpleName, (e.message ?: "").take(120), RED))
+                    ui.post { apply(list) }
+                }
                 Thread.sleep(1000)
             }
         }
         thread {
             while (running.get()) {
-                pingOnce()
+                try { pingOnce() } catch (e: Throwable) { }
                 Thread.sleep(1500)
             }
         }
@@ -131,6 +139,7 @@ class MainActivity : Activity() {
 
     private fun sample() {
         val out = ArrayList<T>()
+        partial = out
 
         // Rede: velocidade
         val now = System.currentTimeMillis()
@@ -187,7 +196,7 @@ class MainActivity : Activity() {
         if (usage == null && freqs.isNotEmpty()) usage = 100.0 * freqs.map { it.first / it.second }.average()
         if (usage != null) {
             val col = if (usage < 60) GREEN else if (usage < 85) YELLOW else RED
-            out.add(T("cpu", "CPU uso", "%.0f%%".format(usage), if (freqs.isEmpty()) "" else "(estimado pela frequência se /proc/stat bloqueado)".takeIf { readFile("/proc/stat") == null } ?: "", col))
+            out.add(T("cpu", "CPU uso", "%.0f%%".format(usage), "", col))
         }
         if (freqs.isNotEmpty()) {
             val top = freqs.maxOf { it.first } / 1e6
