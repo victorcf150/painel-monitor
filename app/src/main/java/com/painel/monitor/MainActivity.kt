@@ -2,22 +2,32 @@ package com.painel.monitor
 
 import android.app.Activity
 import android.app.ActivityManager
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.TrafficStats
 import android.os.BatteryManager
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.StatFs
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -30,9 +40,72 @@ val YELLOW = Color.rgb(241, 196, 15)
 val ORANGE = Color.rgb(230, 126, 34)
 val RED = Color.rgb(231, 76, 60)
 val GRAY = Color.rgb(90, 98, 110)
+val BG = Color.rgb(0, 0, 0)
+val CARD = Color.rgb(15, 17, 23)
 
-data class T(val key: String, val title: String, val value: String, val sub: String = "", val color: Int = GREEN)
-class TV(val box: LinearLayout, val title: TextView, val value: TextView, val sub: TextView)
+const val S_PERF = "DESEMPENHO"
+const val S_STO = "ARMAZENAMENTO E BATERIA"
+const val S_NET = "REDE"
+const val S_TMP = "TEMPERATURAS"
+val SECTIONS = listOf(S_PERF, S_STO, S_NET, S_TMP)
+
+data class T(
+    val key: String, val sec: String, val title: String, val value: String,
+    val sub: String = "", val color: Int = GREEN, val frac: Float? = null, val num: Double? = null
+)
+
+class Spark(ctx: Context) : View(ctx) {
+    var data: List<Float> = emptyList()
+    var color = GREEN
+    var fixed = true
+    private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 3f; strokeJoin = Paint.Join.ROUND
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    override fun onDraw(c: Canvas) {
+        val n = data.size
+        if (n < 2) return
+        val w = width.toFloat()
+        val h = height.toFloat()
+        var lo = 0f
+        var hi = 1f
+        if (!fixed) {
+            lo = data.min(); hi = data.max()
+            if (hi - lo < 1f) hi = lo + 1f
+        }
+        val path = Path()
+        for (i in 0 until n) {
+            val x = w * (i + (60 - n)) / 59f
+            val y = h - 3f - (h - 6f) * ((data[i] - lo) / (hi - lo)).coerceIn(0f, 1f)
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        line.color = color
+        c.drawPath(path, line)
+        val fp = Path(path)
+        fp.lineTo(w, h); fp.lineTo(w * (60 - n) / 59f, h); fp.close()
+        fill.color = Color.argb(40, Color.red(color), Color.green(color), Color.blue(color))
+        c.drawPath(fp, fill)
+    }
+}
+
+class Bar(ctx: Context) : View(ctx) {
+    var frac = 0f
+    var color = GREEN
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    override fun onDraw(c: Canvas) {
+        val h = height.toFloat()
+        val w = width.toFloat()
+        p.color = Color.rgb(38, 42, 54)
+        c.drawRoundRect(0f, 0f, w, h, h / 2, h / 2, p)
+        p.color = color
+        c.drawRoundRect(0f, 0f, w * frac.coerceIn(0f, 1f), h, h / 2, h / 2, p)
+    }
+}
+
+class TV(
+    val sec: String, val box: LinearLayout, val title: TextView, val value: TextView,
+    val sub: TextView, val bar: Bar, val spark: Spark, val compact: Boolean
+)
 
 fun readFile(p: String): String? = try { File(p).readText().trim() } catch (e: Exception) { null }
 
@@ -48,13 +121,13 @@ fun friendly(type: String): String {
     return when {
         "gpu" in t -> "GPU"
         "npu" in t || "nsp" in t -> "NPU"
-        "cpu" in t || "big" in t || "little" in t || "mid" in t || "tsens" in t -> "CPU ($type)"
+        "cpu" in t || "big" in t || "little" in t || "mid" in t || "tsens" in t -> "CPU"
         "batt" in t -> "Bateria"
-        "skin" in t || "xo_therm" in t || "quiet" in t || "sys_therm" in t || "case" in t -> "Superfície ($type)"
-        "pa_therm" in t || "modem" in t || "mdm" in t || "qmi" in t -> "Modem/Rádio ($type)"
-        "usb" in t || "chg" in t || "charg" in t -> "Carregador/USB ($type)"
-        "ddr" in t || "mem" in t -> "Memória ($type)"
-        "wlan" in t || "wifi" in t -> "Wi-Fi ($type)"
+        "skin" in t || "xo_therm" in t || "quiet" in t || "sys_therm" in t || "case" in t -> "Superfície"
+        "pa_therm" in t || "modem" in t || "mdm" in t || "qmi" in t -> "Modem/Rádio"
+        "usb" in t || "chg" in t || "charg" in t -> "Carregador/USB"
+        "ddr" in t || "mem" in t -> "Memória"
+        "wlan" in t || "wifi" in t -> "Wi-Fi"
         else -> type
     }
 }
@@ -62,7 +135,9 @@ fun friendly(type: String): String {
 class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private val views = LinkedHashMap<String, TV>()
-    private lateinit var grid: GridLayout
+    private val hist = HashMap<String, ArrayDeque<Float>>()
+    private val grids = LinkedHashMap<String, GridLayout>()
+    private lateinit var cleanBtn: TextView
     private val running = AtomicBoolean(false)
     private val pings = ArrayList<Double?>()
     private var partial = ArrayList<T>()
@@ -73,16 +148,59 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    private fun tv(size: Float, color: Int): TextView {
+        val t = TextView(this)
+        t.textSize = size
+        t.setTextColor(color)
+        return t
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.statusBarColor = Color.BLACK
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(BG)
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        head.setPadding(dp(16), dp(12), dp(16), dp(8))
+        val title = tv(18f, Color.WHITE)
+        title.text = "PAINEL"
+        title.setTypeface(null, Typeface.BOLD)
+        title.letterSpacing = 0.15f
+        head.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        cleanBtn = tv(13f, Color.WHITE)
+        cleanBtn.text = "Limpar RAM"
+        cleanBtn.setPadding(dp(14), dp(8), dp(14), dp(8))
+        val bb = GradientDrawable()
+        bb.cornerRadius = dp(20).toFloat()
+        bb.setColor(Color.rgb(30, 34, 44))
+        cleanBtn.background = bb
+        cleanBtn.setOnClickListener { cleanRam() }
+        head.addView(cleanBtn)
+        root.addView(head)
+
         val sv = ScrollView(this)
-        sv.setBackgroundColor(Color.rgb(10, 12, 16))
-        grid = GridLayout(this)
-        grid.setPadding(dp(6), dp(6), dp(6), dp(6))
-        sv.addView(grid)
-        setContentView(sv)
-        apply(listOf(T("init", "Painel", "iniciando…", "aguardando primeira leitura", GRAY)))
+        val content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        content.setPadding(dp(12), 0, dp(12), dp(16))
+        for (s in SECTIONS) {
+            val h = tv(11f, Color.rgb(110, 118, 132))
+            h.text = s
+            h.letterSpacing = 0.12f
+            h.setPadding(dp(4), dp(14), 0, dp(4))
+            content.addView(h)
+            val g = GridLayout(this)
+            grids[s] = g
+            content.addView(g)
+        }
+        sv.addView(content)
+        root.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        setContentView(root)
+        apply(listOf(T("init", S_PERF, "Painel", "iniciando…", "aguardando primeira leitura", GRAY)))
     }
 
     override fun onStart() {
@@ -94,7 +212,7 @@ class MainActivity : Activity() {
                     sample()
                 } catch (e: Throwable) {
                     val list = ArrayList(partial)
-                    list.add(T("err", "Erro", e.javaClass.simpleName, (e.message ?: "").take(120), RED))
+                    list.add(T("err", S_PERF, "Erro", e.javaClass.simpleName, (e.message ?: "").take(120), RED))
                     ui.post { apply(list) }
                 }
                 Thread.sleep(1000)
@@ -116,6 +234,38 @@ class MainActivity : Activity() {
     override fun onConfigurationChanged(c: android.content.res.Configuration) {
         super.onConfigurationChanged(c)
         relayout()
+    }
+
+    private fun availMem(): Long {
+        val mi = ActivityManager.MemoryInfo()
+        (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+        return mi.availMem
+    }
+
+    private fun cleanRam() {
+        cleanBtn.text = "Limpando…"
+        cleanBtn.isEnabled = false
+        thread {
+            var n = 0
+            try {
+                val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                val before = availMem()
+                for (ai in packageManager.getInstalledApplications(0)) {
+                    if (ai.packageName == packageName) continue
+                    if ((ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0) continue
+                    if ("shizuku" in ai.packageName) continue
+                    try { am.killBackgroundProcesses(ai.packageName); n++ } catch (e: Exception) { }
+                }
+                Thread.sleep(1200)
+                val freed = (availMem() - before) / 1048576
+                val msg = if (freed > 0) "Pedido enviado a $n apps · +$freed MB livres"
+                else "Pedido enviado a $n apps · pouca diferença"
+                ui.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+            } catch (e: Throwable) {
+                ui.post { Toast.makeText(this, "Não foi possível limpar", Toast.LENGTH_SHORT).show() }
+            }
+            ui.post { cleanBtn.text = "Limpar RAM"; cleanBtn.isEnabled = true }
+        }
     }
 
     private fun pingOnce() {
@@ -141,17 +291,17 @@ class MainActivity : Activity() {
         val out = ArrayList<T>()
         partial = out
 
-        // Rede: velocidade
+        // Rede
         val now = System.currentTimeMillis()
         val rx = TrafficStats.getTotalRxBytes()
         val tx = TrafficStats.getTotalTxBytes()
         if (lastT > 0 && now > lastT) {
             val dt = (now - lastT) / 1000.0
-            out.add(T("net", "Rede", "↓ " + speed((rx - lastRx) / dt), "↑ " + speed((tx - lastTx) / dt), GREEN))
-        } else out.add(T("net", "Rede", "…", "", GRAY))
+            val down = (rx - lastRx) / dt
+            out.add(T("net", S_NET, "Velocidade", "↓ " + speed(down), "↑ " + speed((tx - lastTx) / dt), GREEN, num = down / 1e3))
+        } else out.add(T("net", S_NET, "Velocidade", "…", "", GRAY))
         lastRx = rx; lastTx = tx; lastT = now
 
-        // Rede: ping/jitter/perda
         val p: List<Double?> = synchronized(pings) { ArrayList(pings) }
         if (p.isNotEmpty()) {
             val ok = p.filterNotNull()
@@ -165,11 +315,11 @@ class MainActivity : Activity() {
                 last > 60 || loss > 0 -> YELLOW
                 else -> GREEN
             }
-            out.add(T("ping", "Latência (1.1.1.1)", if (last == null) "falhou" else "%.0f ms".format(last),
-                "jitter %.0f ms · perda %.0f%%".format(jit, loss), col))
+            out.add(T("ping", S_NET, "Latência (1.1.1.1)", if (last == null) "falhou" else "%.0f ms".format(last),
+                "jitter %.0f ms · perda %.0f%%".format(jit, loss), col, num = last))
         }
 
-        // CPU: uso
+        // CPU
         var usage: Double? = null
         try {
             val l = readFile("/proc/stat")?.lines()?.firstOrNull()?.split(Regex("\\s+"))
@@ -185,7 +335,6 @@ class MainActivity : Activity() {
             }
         } catch (e: Exception) { }
 
-        // CPU: frequências
         val freqs = ArrayList<Pair<Double, Double>>()
         for (i in 0 until 16) {
             val d = "/sys/devices/system/cpu/cpu$i/cpufreq"
@@ -196,12 +345,12 @@ class MainActivity : Activity() {
         if (usage == null && freqs.isNotEmpty()) usage = 100.0 * freqs.map { it.first / it.second }.average()
         if (usage != null) {
             val col = if (usage < 60) GREEN else if (usage < 85) YELLOW else RED
-            out.add(T("cpu", "CPU uso", "%.0f%%".format(usage), "", col))
+            out.add(T("cpu", S_PERF, "CPU uso", "%.0f%%".format(usage), "", col, frac = (usage / 100).toFloat()))
         }
         if (freqs.isNotEmpty()) {
             val top = freqs.maxOf { it.first } / 1e6
-            out.add(T("cpufreq", "CPU frequência", "%.2f GHz".format(top),
-                freqs.mapIndexed { i, f -> "$i:%.1f".format(f.first / 1e6) }.joinToString(" "), GREEN))
+            out.add(T("cpufreq", S_PERF, "CPU frequência", "%.2f GHz".format(top),
+                freqs.mapIndexed { i, f -> "$i:%.1f".format(f.first / 1e6) }.joinToString(" "), GREEN, num = top))
         }
 
         // GPU
@@ -220,17 +369,29 @@ class MainActivity : Activity() {
         }
         if (gpuInfo != null || gpuBusy != null) {
             val g = gpuBusy
-            out.add(T("gpu", "GPU", if (g != null) "%.0f%%".format(g) else gpuInfo!!, gpuInfo ?: "",
-                if (g == null || g < 85) GREEN else YELLOW))
-        } else out.add(T("gpu", "GPU uso/freq", "sem acesso", "bloqueado sem Shizuku", GRAY))
+            out.add(T("gpu", S_PERF, "GPU", if (g != null) "%.0f%%".format(g) else gpuInfo!!, gpuInfo ?: "",
+                if (g == null || g < 85) GREEN else YELLOW, frac = g?.let { (it / 100).toFloat() }))
+        } else out.add(T("gpu", S_PERF, "GPU uso/freq", "sem acesso", "bloqueado sem Shizuku", GRAY))
 
         // RAM
         val mi = ActivityManager.MemoryInfo()
         (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
         val usedPct = 100.0 * (mi.totalMem - mi.availMem) / mi.totalMem
-        out.add(T("ram", "RAM", "%.0f%%".format(usedPct),
+        out.add(T("ram", S_PERF, "RAM", "%.0f%%".format(usedPct),
             "%.1f / %.1f GB".format((mi.totalMem - mi.availMem) / 1e9, mi.totalMem / 1e9),
-            if (usedPct < 75) GREEN else if (usedPct < 90) YELLOW else RED))
+            if (usedPct < 75) GREEN else if (usedPct < 90) YELLOW else RED, frac = (usedPct / 100).toFloat()))
+
+        out.add(T("jank", S_PERF, "Engasgos / FPS", "em breve", "requer Shizuku (fase 2)", GRAY))
+
+        // Armazenamento interno
+        val sf = StatFs(Environment.getDataDirectory().path)
+        val tot = sf.blockCountLong * sf.blockSizeLong
+        val free = sf.availableBlocksLong * sf.blockSizeLong
+        val usedF = 1.0 - free.toDouble() / tot
+        out.add(T("sto", S_STO, "Armazenamento interno", "%.0f%%".format(usedF * 100),
+            if (usedF >= 0.9) "quase cheio! %.1f GB livres".format(free / 1e9)
+            else "%.1f GB livres de %.0f GB".format(free / 1e9, tot / 1e9),
+            if (usedF < 0.8) GREEN else if (usedF < 0.9) YELLOW else RED, frac = usedF.toFloat()))
 
         // Bateria
         val bi = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
@@ -240,13 +401,10 @@ class MainActivity : Activity() {
             val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
             var cur = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW).toDouble()
             if (abs(cur) > 10000) cur /= 1000
-            out.add(T("bat", "Bateria", "%.1f°C".format(bt), "$lvl% · %.0f mA".format(cur), tempColor(bt)))
+            out.add(T("bat", S_STO, "Bateria", "%.1f°C".format(bt), "$lvl% · %.0f mA".format(cur), tempColor(bt), frac = lvl / 100f))
         }
 
-        // Engasgos / FPS (fase 2)
-        out.add(T("jank", "Engasgos / FPS", "em breve", "requer Shizuku (fase 2)", GRAY))
-
-        // Todos os sensores térmicos
+        // Sensores térmicos
         var found = 0
         for (i in 0 until 80) {
             val d = "/sys/class/thermal/thermal_zone$i"
@@ -255,55 +413,97 @@ class MainActivity : Activity() {
             val c = if (abs(raw) >= 1000) raw / 1000 else raw
             if (c <= -40 || c > 150 || c == 0.0) continue
             found++
-            out.add(T("tz$i", friendly(type), "%.1f°C".format(c), "zona $i · $type", tempColor(c)))
+            out.add(T("tz$i", S_TMP, friendly(type), "%.1f°C".format(c), "zona $i · $type", tempColor(c)))
         }
-        if (found == 0) out.add(T("tzx", "Sensores térmicos", "sem acesso", "o Android bloqueou /sys/class/thermal", YELLOW))
+        if (found == 0) out.add(T("tzx", S_TMP, "Sensores térmicos", "sem acesso", "o Android bloqueou /sys/class/thermal", YELLOW))
 
         ui.post { apply(out) }
     }
 
     private fun apply(list: List<T>) {
-        var created = false
+        var changed = false
+        for (k in listOf("init", "err")) {
+            if (views.containsKey(k) && list.none { it.key == k }) { views.remove(k); changed = true }
+        }
         for (t in list) {
             var v = views[t.key]
             if (v == null) {
-                v = makeTile(); views[t.key] = v; created = true
+                v = makeTile(t.sec); views[t.key] = v; changed = true
             }
             v.title.text = t.title
             v.value.text = t.value
             v.sub.text = t.sub
             val bg = GradientDrawable()
-            bg.cornerRadius = dp(12).toFloat()
-            bg.setColor(Color.rgb(22, 26, 34))
-            bg.setStroke(dp(2), t.color)
+            bg.cornerRadius = dp(14).toFloat()
+            bg.setColor(CARD)
+            bg.setStroke(dp(1), Color.argb(150, Color.red(t.color), Color.green(t.color), Color.blue(t.color)))
             v.box.background = bg
+            if (!v.compact) {
+                v.bar.visibility = if (t.frac != null) View.VISIBLE else View.GONE
+                v.bar.frac = t.frac ?: 0f
+                v.bar.color = t.color
+                v.bar.invalidate()
+                val pt = t.frac ?: t.num?.toFloat()
+                if (pt != null) {
+                    val h = hist.getOrPut(t.key) { ArrayDeque() }
+                    h.addLast(pt)
+                    if (h.size > 60) h.removeFirst()
+                    v.spark.data = h.toList()
+                    v.spark.color = t.color
+                    v.spark.fixed = t.frac != null
+                    v.spark.visibility = View.VISIBLE
+                    v.spark.invalidate()
+                } else v.spark.visibility = View.GONE
+            }
         }
-        if (created) relayout()
+        if (changed) relayout()
     }
 
-    private fun makeTile(): TV {
+    private fun makeTile(sec: String): TV {
+        val compact = sec == S_TMP
         val box = LinearLayout(this)
         box.orientation = LinearLayout.VERTICAL
-        box.setPadding(dp(10), dp(10), dp(10), dp(10))
-        val title = TextView(this); title.textSize = 12f; title.setTextColor(Color.rgb(160, 168, 180))
-        val value = TextView(this); value.textSize = 26f; value.setTextColor(Color.WHITE); value.setTypeface(null, Typeface.BOLD)
-        val sub = TextView(this); sub.textSize = 11f; sub.setTextColor(Color.rgb(130, 138, 150))
-        box.addView(title); box.addView(value); box.addView(sub)
-        return TV(box, title, value, sub)
+        val pad = if (compact) dp(9) else dp(12)
+        box.setPadding(pad, pad, pad, pad)
+        val title = tv(11f, Color.rgb(140, 148, 162))
+        title.maxLines = 1
+        val value = tv(if (compact) 17f else 26f, Color.WHITE)
+        value.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        val sub = tv(10.5f, Color.rgb(120, 128, 142))
+        sub.maxLines = if (compact) 1 else 2
+        sub.ellipsize = android.text.TextUtils.TruncateAt.END
+        val bar = Bar(this)
+        val spark = Spark(this)
+        box.addView(title)
+        box.addView(value)
+        box.addView(sub)
+        if (!compact) {
+            val lb = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(5))
+            lb.topMargin = dp(6)
+            box.addView(bar, lb)
+            val ls = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30))
+            ls.topMargin = dp(6)
+            box.addView(spark, ls)
+        }
+        return TV(sec, box, title, value, sub, bar, spark, compact)
     }
 
     private fun relayout() {
         val wDp = resources.configuration.screenWidthDp
-        val cols = maxOf(2, wDp / 170)
-        val tileW = (dp(wDp) - dp(12)) / cols - dp(8)
-        grid.removeAllViews()
-        grid.columnCount = cols
-        for (v in views.values) {
-            val lp = GridLayout.LayoutParams()
-            lp.width = tileW
-            lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
-            lp.setMargins(dp(4), dp(4), dp(4), dp(4))
-            grid.addView(v.box, lp)
+        for ((sec, grid) in grids) {
+            val compact = sec == S_TMP
+            val cols = if (compact) maxOf(3, wDp / 125) else maxOf(2, wDp / 175)
+            val tileW = (dp(wDp) - dp(24)) / cols - dp(8)
+            grid.removeAllViews()
+            grid.columnCount = cols
+            for (v in views.values) {
+                if (v.sec != sec) continue
+                val lp = GridLayout.LayoutParams()
+                lp.width = tileW
+                lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
+                lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+                grid.addView(v.box, lp)
+            }
         }
     }
 }
